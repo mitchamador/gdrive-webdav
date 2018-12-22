@@ -9,7 +9,7 @@ import (
 	"runtime"
 
 	log "github.com/cihub/seelog"
-	"github.com/mikea/gdrive-webdav/gdrive"
+	"./gdrive"
 	"golang.org/x/net/context"
 	"golang.org/x/net/webdav"
 )
@@ -60,7 +60,7 @@ func main() {
 
 func initLogging() error {
 	config := `
-	<seelog type="sync" minlevel="debug">
+	<seelog type="sync" minlevel="trace">
 	<outputs>
 		<filter levels="error,critical">
 			<console formatid="error"/>
@@ -75,9 +75,9 @@ func initLogging() error {
 	<formats>
 		<format id="default" format="%Date %Time %Lev %File:%Line %Msg%n"/>
 		<format id="info" format="%Date %Time %EscM(32)%Lev%EscM(39) %File:%Line %Msg%n%EscM(0)"/>
-  	<format id="error" format="%Date %Time %EscM(31)%Lev%EscM(39) %File:%Line %Msg%n%EscM(0)"/>
+  		<format id="error" format="%Date %Time %EscM(31)%Lev%EscM(39) %File:%Line %Msg%n%EscM(0)"/>
 	</formats>
-</seelog>
+	</seelog>
 `
 
 	logger, err := log.LoggerFromConfigAsString(config)

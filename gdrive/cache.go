@@ -9,6 +9,7 @@ import (
 const (
 	cacheKeyAbout = "global:about"
 	cacheKeyFile  = "file:"
+	cacheKeyDir  = "file:"
 )
 
 func (fs *fileSystem) invalidatePath(p string) {
@@ -33,7 +34,7 @@ func (fs *fileSystem) getFile(p string, onlyFolder bool) (*fileAndPath, error) {
 
 	fp, err := fs.getFile0(p, onlyFolder)
 	lookup := &fileLookupResult{fp: fp, err: err}
-	if err != nil {
+	if err == nil {
 		fs.cache.Set(key, lookup, time.Minute)
 	}
 	return lookup.fp, lookup.err

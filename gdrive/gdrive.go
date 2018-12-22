@@ -9,8 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"io/ioutil"
-
 	"io"
 
 	log "github.com/cihub/seelog"
@@ -31,8 +29,9 @@ const (
 )
 
 type fileAndPath struct {
-	file *drive.File
-	path string
+	file  *drive.File
+	path  string
+	files []*drive.File
 }
 
 // NewFS creates new gdrive file system.
@@ -190,6 +189,8 @@ type openReadonlyFile struct {
 	size          int64
 	pos           int64
 	contentReader io.Reader
+	name          string
+	body		  io.ReadCloser
 }
 
 func (f *openReadonlyFile) Write(p []byte) (int, error) {
@@ -198,7 +199,48 @@ func (f *openReadonlyFile) Write(p []byte) (int, error) {
 }
 
 func (f *openReadonlyFile) Readdir(count int) ([]os.FileInfo, error) {
-	panic("not supported")
+
+	files := []os.FileInfo{}
+	aLookup := &fileLookupResult{}
+
+	if lookup, found := f.fs.cache.Get(cacheKeyDir + f.file.Id); found {
+		log.Trace("Reusing cached file: ", f.file.Id)
+		aLookup = lookup.(*fileLookupResult)
+	} else {
+		query := fmt.Sprintf("'%s' in parents", f.file.Id)
+		r, err := f.fs.client.Files.List().Q(query).Fields("files(id,name,mimeType,trashed,parents,size,parents,createdTime,modifiedTime)").Do()
+
+		if err != nil {
+			log.Error("Can't list children ", err)
+			return nil, err
+		}
+
+		lookup := &fileLookupResult{fp: &fileAndPath{
+			file:  f.file,
+			path:  f.file.Id,
+			files: r.Files,
+		}, err: nil}
+
+		f.fs.cache.Set(cacheKeyDir + lookup.fp.path, lookup, time.Minute)
+
+		aLookup = lookup
+	}
+
+	for _, file := range aLookup.fp.files {
+		if ignoreFile(file) {
+			continue
+		}
+		files = append(files, newFileInfo(file))
+
+		lookup := &fileLookupResult{fp: &fileAndPath{
+			file: file,
+			path: f.name + "/" + file.Name,
+		}, err: nil}
+
+		f.fs.cache.Set(cacheKeyFile + lookup.fp.path, lookup, time.Minute)
+	}
+
+	return files, nil
 }
 
 func (f *openReadonlyFile) Stat() (os.FileInfo, error) {
@@ -206,42 +248,43 @@ func (f *openReadonlyFile) Stat() (os.FileInfo, error) {
 }
 
 func (f *openReadonlyFile) Close() error {
+	log.Debug("Close ", f.name)
 	f.content = nil
+	if f.body != nil {
+		f.body.Close()
+	}
 	f.contentReader = nil
 	return nil
 }
 
-func (f *openReadonlyFile) initContent() error {
-	if f.content != nil {
+func (f *openReadonlyFile) initContentReader() error {
+	if f.contentReader != nil {
 		return nil
 	}
 
-	resp, err := f.fs.client.Files.Get(f.file.Id).Download()
+	// Get timeout reader wrapper and context
+	timeoutReaderWrapper, ctx := getTimeoutReaderWrapperContext(time.Second * 15)
+
+	res, err := f.fs.client.Files.Get(f.file.Id).Context(ctx).Download()
 	if err != nil {
-		log.Error(err)
+		if err == context.Canceled {
+			log.Errorf("Failed to download file: timeout, no data was transferred for %v", time.Second * 15)
+			return err
+		}
+		log.Errorf("Failed to download file: %s", err)
 		return err
 	}
 
-	content, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		log.Error(err)
-		return err
-	}
-	err = resp.Body.Close()
-	if err != nil {
-		log.Error(err)
-		return err
-	}
+	f.body = res.Body
+	f.contentReader = timeoutReaderWrapper(f.body)
 
-	f.size = int64(len(content))
-	f.content = content
-	f.contentReader = bytes.NewBuffer(content)
 	return nil
 }
 
 func (f *openReadonlyFile) Read(p []byte) (n int, err error) {
 	log.Debug("Read ", len(p))
-	err = f.initContent()
+	//err = f.initContent()
+	err = f.initContentReader()
 
 	if err != nil {
 		log.Error(err)
@@ -253,6 +296,12 @@ func (f *openReadonlyFile) Read(p []byte) (n int, err error) {
 		log.Error(err)
 		return 0, err
 	}
+
+	if err != nil {
+		log.Error(err)
+		return 0, err
+	}
+
 	f.pos += int64(n)
 	return n, err
 }
@@ -261,22 +310,25 @@ func (f *openReadonlyFile) Seek(offset int64, whence int) (int64, error) {
 	log.Debug("Seek ", offset, whence)
 
 	if whence == 0 {
-		// io.SeekStart
-		if f.content != nil {
-			f.pos = 0
-			f.contentReader = bytes.NewBuffer(f.content)
-			return 0, nil
-		}
+		//// io.SeekStart
+		//if f.content != nil {
+		//	f.pos = 0
+		//	f.contentReader = bytes.NewBuffer(f.content)
+		//	return 0, nil
+		//}
+		f.pos = 0
 		return f.pos, nil
 	}
 
 	if whence == 2 {
-		// io.SeekEnd
-		err := f.initContent()
-		if err != nil {
-			return 0, err
-		}
-		f.contentReader = &bytes.Buffer{}
+		//// io.SeekEnd
+		//err := f.initContent()
+		//if err != nil {
+		//	return 0, err
+		//}
+		//f.contentReader = &bytes.Buffer{}
+		//f.pos = f.size
+		f.size = f.file.Size
 		f.pos = f.size
 		return f.pos, nil
 	}
@@ -307,7 +359,7 @@ func (fs *fileSystem) OpenFile(ctx context.Context, name string, flag int, perm 
 		if err != nil {
 			return nil, err
 		}
-		return &openReadonlyFile{fs: fs, file: file.file}, nil
+		return &openReadonlyFile{fs: fs, file: file.file, name: name}, nil
 	}
 
 	return nil, fmt.Errorf("unsupported open mode: %v", flag)
@@ -338,6 +390,7 @@ func (fs *fileSystem) Rename(ctx context.Context, oldName, newName string) error
 }
 
 type fileInfo struct {
+	name	string
 	isDir   bool
 	modTime time.Time
 	size    int64
@@ -351,6 +404,7 @@ func newFileInfo(file *drive.File) *fileInfo {
 	}
 
 	return &fileInfo{
+		name:	 file.Name,
 		isDir:   file.MimeType == mimeTypeFolder,
 		modTime: modTime,
 		size:    file.Size,
@@ -379,9 +433,9 @@ func (fi *fileInfo) IsDir() bool {
 }
 
 func (fi *fileInfo) Name() string {
-	log.Critical("not implemented")
-	panic("not implemented")
+	return fi.name
 }
+
 func (fi *fileInfo) Size() int64 {
 	return fi.size
 }
@@ -411,264 +465,7 @@ func (fs *fileSystem) Stat(ctx context.Context, name string) (os.FileInfo, error
 	}
 
 	return newFileInfo(f.file), nil
-	// files := []*fileAndPath{f}
-
-	// query := fmt.Sprintf("'%s' in parents", f.file.Id)
-	// r, err := fs.client.Files.List().Q(query).Do()
-
-	// if err != nil {
-	// 	log.Error("Can't list children ", err)
-	// 	return nil, err
-	// }
-
-	// for _, file := range r.Files {
-	// 	if ignoreFile(file) {
-	// 		continue
-	// 	}
-
-	// 	files = append(files, &fileAndPath{file: file, path: path.Join(name, file.Name)})
-	// }
-
-	// return fs.listPropsFromFiles(files, props)
 }
-
-/*
-
-
-// Get downloads the file.
-func (fs *FileSystem) Get(p string) (webdav.StatusCode, io.ReadCloser, int64) {
-	pFile := fs.getFile(p, false)
-	if pFile == nil {
-		return webdav.StatusCode(404), nil, -1
-	}
-
-	f := pFile.file
-	downloadURL := f.WebContentLink
-	log.Debug("downloadURL=", downloadURL)
-	if downloadURL == "" {
-		log.Error("No download url: ", f)
-		return webdav.StatusCode(500), nil, -1
-	}
-
-	req, err := http.NewRequest("GET", downloadURL, nil)
-	if err != nil {
-		log.Error("NewRequest ", err)
-		return webdav.StatusCode(500), nil, -1
-	}
-
-	resp, err := fs.roundTripper.RoundTrip(req)
-	if err != nil {
-		log.Error("RoundTrip ", err)
-		return webdav.StatusCode(500), nil, -1
-	}
-
-	return webdav.StatusCode(200), resp.Body, f.Size
-}
-
-// PropList fetches file properties.
-func (fs *FileSystem) PropList(p string, depth int, props []string) (webdav.StatusCode, map[string][]webdav.PropertyValue) {
-}
-
-// Copy creates a file copy.
-func (fs *FileSystem) Copy(from string, to string, depth int, overwrite bool) webdav.CopyStatusCode {
-	log.Debug("DoCopy ", from, " -> ", to)
-	to = strings.TrimRight(to, "/")
-
-	fromFile := fs.getFile(from, false)
-
-	log.Debug("1", to)
-	if fromFile == nil {
-		log.Debug("Src not found: ", from)
-		return webdav.CopyNotFound
-	}
-
-	log.Debug("2", to)
-	toFile := fs.getFile(to, false)
-
-	log.Debug("3", to)
-	if !overwrite && toFile != nil {
-		log.Debug("Target exists but overwrite is false ", to)
-		return webdav.CopyPreconditionFailed
-	}
-
-	log.Debug("4", to)
-	status := webdav.CopyCreated
-
-	log.Debug("5", to)
-	if toFile != nil {
-		deleteStatus := fs.Delete(to)
-		log.Debug("Deleting target: ", to, " : ", deleteStatus)
-		if deleteStatus != webdav.DeleteDeleted {
-			log.Debug("Can't delete target folder")
-			return webdav.CopyUnknownError
-		}
-		status = webdav.CopyNoContent
-	}
-
-	log.Debug("6", to)
-	toDir := path.Dir(to)
-	toBase := path.Base(to)
-
-	toDirFile := fs.getFile(toDir, true)
-	if toDirFile == nil {
-		log.Error("To dir ", toDir, " not found")
-		return webdav.CopyConflict
-	}
-
-	log.Debug("7", to)
-	if isFolder(fromFile.file) {
-		log.Error("Directory copy not supported")
-		return webdav.CopyUnknownError
-	}
-
-	f := &drive.File{
-		Name:    toBase,
-		Parents: []string{toDirFile.file.Id},
-	}
-
-	log.Debug("9", to)
-	_, err := fs.client.Files.Copy(fromFile.file.Id, f).Do()
-	if err != nil {
-		log.Error("Copy failed: ", err)
-		return webdav.CopyUnknownError
-	}
-
-	log.Debug("10", to)
-	fs.invalidatePath(to)
-	log.Debug("Copy done: ", status)
-	return status
-}
-
-// Move moves the file.
-func (fs *FileSystem) Move(from string, to string, overwrite bool) webdav.MoveStatusCode {
-	fromFile := fs.getFile(from, false)
-	toFile := fs.getFile(to, false)
-
-	if !overwrite && toFile != nil {
-		return webdav.CopyPreconditionFailed
-	}
-
-	if toFile != nil {
-		log.Error("Overwrite not supported")
-		return webdav.CopyUnknownError
-	}
-
-	toDir := path.Dir(to)
-	toBase := path.Base(to)
-
-	toDirFile := fs.getFile(toDir, true)
-	if toDirFile == nil {
-		log.Error("To dir not found")
-		return webdav.CopyConflict
-	}
-
-	f := &drive.File{
-		Name:    toBase,
-		Parents: []string{toDirFile.file.Id},
-	}
-
-	_, err := fs.client.Files.Update(fromFile.file.Id, f).Do()
-	if err != nil {
-		log.Error("Patch failed: ", err)
-		return webdav.CopyUnknownError
-	}
-
-	fs.invalidatePath(to)
-	return webdav.MoveCreated
-}
-
-func (fs *FileSystem) listPropsFromFiles(files []*fileAndPath, props []string) (webdav.StatusCode, map[string][]webdav.PropertyValue) {
-	result := make(map[string][]webdav.PropertyValue)
-
-	for _, fp := range files {
-		f := fp.file
-
-		var pValues []webdav.PropertyValue
-
-		for _, p := range props {
-			switch p {
-			case "getcontentlength":
-				pValues = append(pValues, webdav.GetContentLengthPropertyValue(f.Size))
-			case "displayname":
-				pValues = append(pValues, webdav.DisplayNamePropertyValue(f.Name))
-			case "resourcetype":
-				b := false
-				if isFolder(f) {
-					b = true
-				}
-				pValues = append(pValues, webdav.ResourceTypePropertyValue(b))
-			case "getcontenttype":
-				s := f.MimeType
-				if isFolder(f) {
-					s = "httpd/unix-directory"
-				}
-				pValues = append(pValues, webdav.GetContentTypePropertyValue(s))
-			case "getlastmodified":
-				t, err := time.Parse(time.RFC3339, f.ModifiedTime)
-				if err != nil {
-					log.Error("Can't parse modified date ", err, " ", f.ModifiedTime)
-					return webdav.StatusCode(500), nil
-				}
-				pValues = append(pValues, webdav.GetLastModifiedPropertyValue(t.Unix()))
-			case "creationdate":
-				t, err := time.Parse(time.RFC3339, f.CreatedTime)
-				if err != nil {
-					log.Error("Can't parse CreationDate date ", err, " ", f.CreatedTime)
-					return webdav.StatusCode(500), nil
-				}
-				pValues = append(pValues, webdav.GetLastModifiedPropertyValue(t.Unix()))
-			case "getetag":
-				pValues = append(pValues, webdav.GetEtagPropertyValue(""))
-			case "quota-available-bytes":
-				about, err := fs.about()
-				if err != nil {
-					log.Error("Can't get about info: ", err)
-					return webdav.StatusCode(500), nil
-				}
-				pValues = append(pValues, webdav.QuotaAvailableBytesPropertyValue(about.StorageQuota.Limit-about.StorageQuota.Usage))
-			case "quota-used-bytes":
-				about, err := fs.about()
-				if err != nil {
-					log.Error("Can't get about info: ", err)
-					return webdav.StatusCode(500), nil
-				}
-				pValues = append(pValues, webdav.QuotaUsedBytesPropertyValue(about.StorageQuota.UsageInDrive))
-			case "quotaused", "quota":
-				// ignore
-				continue
-			default:
-				log.Error("Unsupported property: ", p)
-				return webdav.StatusCode(500), nil
-			}
-		}
-
-		result[fp.path] = pValues
-	}
-
-	return webdav.StatusCode(200), result
-}
-
-
-
-func isFolder(f *drive.File) bool {
-	return f.MimeType == mimeTypeFolder
-}
-
-func (fs *FileSystem) about() (*drive.About, error) {
-	if about, found := fs.cache.Get(cacheKeyAbout); found {
-		return about.(*drive.About), nil
-	}
-
-	about, err := fs.client.About.Get().Do()
-	if err != nil {
-		log.Error("Can't get about info: ", err)
-		return nil, err
-	}
-	fs.cache.Set(cacheKeyAbout, about, time.Minute)
-	return about, nil
-}
-
-*/
 
 func (fs *fileSystem) getFileID(p string, onlyFolder bool) (string, error) {
 	f, err := fs.getFile(p, onlyFolder)
@@ -703,11 +500,12 @@ func (fs *fileSystem) getFile0(p string, onlyFolder bool) (*fileAndPath, error) 
 	}
 
 	q := fs.client.Files.List()
-	query := fmt.Sprintf("'%s' in parents and name='%s'", parentID, base)
+	query := fmt.Sprintf("'%s' in parents and name=\"%s\"", parentID, base)
 	if onlyFolder {
 		query += " and mimeType='" + mimeTypeFolder + "'"
 	}
 	q.Q(query)
+	q.Fields("files(id,name,mimeType,trashed,parents,size,parents,createdTime,modifiedTime)")
 	log.Tracef("Query: %v", q)
 
 	r, err := q.Do()
