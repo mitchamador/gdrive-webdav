@@ -23,14 +23,15 @@ type fileLookupResult struct {
 }
 
 func (fs *fileSystem) getFile(p string, onlyFolder bool) (*fileAndPath, error) {
-	log.Tracef("getFile %v %v", p, onlyFolder)
 	key := cacheKeyFile + p
 
 	if lookup, found := fs.cache.Get(key); found {
-		log.Trace("Reusing cached file: ", p)
+		log.Tracef("getFile cache hit %v %v", p, onlyFolder)
 		result := lookup.(*fileLookupResult)
 		return result.fp, result.err
 	}
+
+	log.Tracef("getFile %v %v", p, onlyFolder)
 
 	fp, err := fs.getFile0(p, onlyFolder)
 	lookup := &fileLookupResult{fp: fp, err: err}
