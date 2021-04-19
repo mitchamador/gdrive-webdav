@@ -121,8 +121,8 @@ func (f *openWritableFile) Readdir(count int) ([]os.FileInfo, error) {
 
 func (f *openWritableFile) Stat() (os.FileInfo, error) {
 	return &fileInfo{
-		isDir: false,
-		size:  f.size,
+		isDir:        false,
+		size:         f.size,
 	}, nil
 }
 
@@ -221,7 +221,7 @@ func (f *openReadonlyFile) Readdir(count int) ([]os.FileInfo, error) {
 			files: r.Files,
 		}, err: nil}
 
-		f.fs.cache.Set(cacheKeyDir + lookup.fp.path, lookup, time.Minute)
+		f.fs.cache.Set(cacheKeyDir + lookup.fp.path, lookup, 5*time.Second)
 
 		aLookup = lookup
 	}
@@ -266,9 +266,10 @@ func (f *openReadonlyFile) initContentReader() error {
 	timeoutReaderWrapper, ctx := getTimeoutReaderWrapperContext(time.Second * 15)
 
 	res, err := f.fs.client.Files.Get(f.file.Id).Context(ctx).Download()
+
 	if err != nil {
 		if err == context.Canceled {
-			log.Errorf("Failed to download file: timeout, no data was transferred for %v", time.Second * 15)
+			log.Errorf("Failed to download file: timeout, no data was transferred for %v", time.Second*15)
 			return err
 		}
 		log.Errorf("Failed to download file: %s", err)
@@ -292,11 +293,6 @@ func (f *openReadonlyFile) Read(p []byte) (n int, err error) {
 	}
 
 	n, err = f.contentReader.Read(p)
-	if err != nil {
-		log.Error(err)
-		return 0, err
-	}
-
 	if err != nil {
 		log.Error(err)
 		return 0, err
@@ -390,10 +386,15 @@ func (fs *fileSystem) Rename(ctx context.Context, oldName, newName string) error
 }
 
 type fileInfo struct {
-	name	string
-	isDir   bool
-	modTime time.Time
-	size    int64
+	name         string
+	isDir        bool
+	modTime      time.Time
+	size         int64
+}
+
+
+func (fi *fileInfo) ContentType(ctx context.Context) (string, error) {
+	return "application/octet-stream", nil
 }
 
 func newFileInfo(file *drive.File) *fileInfo {
@@ -404,10 +405,10 @@ func newFileInfo(file *drive.File) *fileInfo {
 	}
 
 	return &fileInfo{
-		name:	 file.Name,
-		isDir:   file.MimeType == mimeTypeFolder,
-		modTime: modTime,
-		size:    file.Size,
+		name:         file.Name,
+		isDir:        file.MimeType == mimeTypeFolder,
+		modTime:      modTime,
+		size:         file.Size,
 	}
 }
 
@@ -506,7 +507,7 @@ func (fs *fileSystem) getFile0(p string, onlyFolder bool) (*fileAndPath, error) 
 	}
 	q.Q(query)
 	q.Fields("files(id,name,mimeType,trashed,parents,size,parents,createdTime,modifiedTime)")
-	log.Tracef("Query: %v", q)
+	log.Tracef("Query: %v", query)
 
 	r, err := q.Do()
 
