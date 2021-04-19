@@ -7,14 +7,16 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"runtime"
+	"strings"
 
-	log "github.com/cihub/seelog"
 	"./gdrive"
+	log "github.com/cihub/seelog"
 	"golang.org/x/net/context"
 	"golang.org/x/net/webdav"
 )
 
 var (
+	loglevel	 = flag.String("loglevel", "info", "Logging level")
 	addr         = flag.String("addr", ":8765", "WebDAV service address")
 	clientID     = flag.String("client-id", "", "OAuth client id")
 	clientSecret = flag.String("client-secret", "", "OAuth client secret")
@@ -22,6 +24,7 @@ var (
 
 func main() {
 	defer log.Flush()
+
 	err := initLogging()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Can't initialize logging: %v", err)
@@ -59,8 +62,8 @@ func main() {
 }
 
 func initLogging() error {
-	config := `
-	<seelog type="sync" minlevel="trace">
+	var config = `
+	<seelog type="sync" minlevel="${loglevel}">
 	<outputs>
 		<filter levels="error,critical">
 			<console formatid="error"/>
@@ -77,8 +80,9 @@ func initLogging() error {
 		<format id="info" format="%Date %Time %EscM(32)%Lev%EscM(39) %File:%Line %Msg%n%EscM(0)"/>
   		<format id="error" format="%Date %Time %EscM(31)%Lev%EscM(39) %File:%Line %Msg%n%EscM(0)"/>
 	</formats>
-	</seelog>
-`
+	</seelog>`
+
+	config = strings.Replace(config, "${loglevel}", *loglevel, -1)
 
 	logger, err := log.LoggerFromConfigAsString(config)
 	if err != nil {
